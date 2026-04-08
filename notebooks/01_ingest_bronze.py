@@ -71,7 +71,7 @@ spark = SparkSession.builder.getOrCreate()
 #
 # Adjust these paths to match your workspace setup.
 
-SOURCE_BASE_PATH = "/FileStore/tables/sources"
+SOURCE_BASE_PATH = "/FileStore/tables"
 BRONZE_BASE_PATH = "/delta/bronze"
 
 # Database (schema) that will hold our Bronze tables.
