@@ -179,6 +179,7 @@ def generate_parktech(path: str):
                 else:
                     card_scheme    = pick_card_scheme()
                     payment_method = random.choices(CARD_PAYMENT_METHODS, weights=CARD_PAYMENT_WEIGHTS)[0]
+                    psp            = "Stripe"
                     acquirer       = "Stripe"   # Stripe acquires all card types
                     psp_reference  = stripe_ref()
 
@@ -205,7 +206,7 @@ def generate_parktech(path: str):
                     "charge_amount":   charge_display,
                     "discount_code":   disc_code,
                     "product_id":      prod_id,
-                    "psp":             "Stripe",
+                    "psp":             psp,
                     "acquirer":        acquirer,
                     "psp_reference":   psp_reference,
                 })
@@ -241,6 +242,7 @@ def generate_vendpark(path: str):
                 else:
                     card_scheme    = pick_card_scheme()
                     raw_method     = random.choices(CARD_PAYMENT_METHODS, weights=CARD_PAYMENT_WEIGHTS)[0]
+                    psp            = "ADVAM"
                     acquirer       = resolve_acquirer_advam_six(card_scheme)
                     psp_reference  = advam_ref()
 
@@ -283,7 +285,7 @@ def generate_vendpark(path: str):
                     "amount_charged": str(final),
                     "discount_code": disc_code,
                     "product_id":    prod_id,
-                    "psp":           "ADVAM",
+                    "psp":           psp,
                     "acquirer":      acquirer,
                     "psp_reference": psp_reference,
                 })
@@ -327,6 +329,7 @@ def generate_easyentry(path: str):
                 else:
                     card_scheme    = pick_card_scheme()
                     payment_method = random.choices(CARD_PAYMENT_METHODS, weights=CARD_PAYMENT_WEIGHTS)[0]
+                    psp            = "SIX"
                     acquirer       = resolve_acquirer_advam_six(card_scheme)
                     psp_reference  = six_ref()
 
@@ -358,7 +361,7 @@ def generate_easyentry(path: str):
                     "charge":        charge_str,
                     "discount_code": disc_code,
                     "product_id":    prod_id,
-                    "psp":           "SIX",
+                    "psp":           psp,
                     "acquirer":      acquirer,
                     "psp_reference": psp_reference,
                 })
