@@ -395,28 +395,10 @@ def _write(path: str, rows: list):
 # ─── Run ─────────────────────────────────────────────────────────────────────
 
 import os
-import shutil
+os.makedirs("data/sources", exist_ok=True)
 
-# Write to driver local storage first
-os.makedirs("/tmp/parking_sources", exist_ok=True)
+generate_parktech ("data/sources/parktech_march_2025.csv")
+generate_vendpark ("data/sources/vendpark_march_2025.csv")
+generate_easyentry("data/sources/easyentry_march_2025.csv")
+generate_site_map ("data/sources/site_map.csv")
 
-generate_parktech ("/tmp/parking_sources/parktech_march_2025.csv")
-generate_vendpark ("/tmp/parking_sources/vendpark_march_2025.csv")
-generate_easyentry("/tmp/parking_sources/easyentry_march_2025.csv")
-generate_site_map ("/tmp/parking_sources/site_map.csv")
-
-# Copy from driver local to DBFS using dbutils
-for filename in [
-    "parktech_march_2025.csv",
-    "vendpark_march_2025.csv",
-    "easyentry_march_2025.csv",
-    "site_map.csv",
-]:
-    dbutils.fs.cp(
-        f"file:/tmp/parking_sources/{filename}",
-        f"dbfs:/FileStore/tables/{filename}",
-        recurse=False
-    )
-    print(f"Copied {filename} to DBFS")
-
-print("\nAll files regenerated and uploaded to DBFS.")
