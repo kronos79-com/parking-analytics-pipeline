@@ -395,9 +395,9 @@ def _write(path: str, rows: list):
 # ─── Run ─────────────────────────────────────────────────────────────────────
 
 import os
-os.makedirs("/home/claude/datasets_v2", exist_ok=True)
+os.makedirs("/dbfs/FileStore/tables", exist_ok=True)
 
-generate_parktech ("/home/claude/datasets_v2/parktech_march_2025.csv")
-generate_vendpark ("/home/claude/datasets_v2/vendpark_march_2025.csv")
-generate_easyentry("/home/claude/datasets_v2/easyentry_march_2025.csv")
-generate_site_map ("/home/claude/datasets_v2/site_map.csv")
+generate_parktech ("/dbfs/FileStore/tables/parktech_march_2025.csv")
+generate_vendpark ("/dbfs/FileStore/tables/vendpark_march_2025.csv")
+generate_easyentry("/dbfs/FileStore/tables/easyentry_march_2025.csv")
+generate_site_map ("/dbfs/FileStore/tables/site_map.csv")
