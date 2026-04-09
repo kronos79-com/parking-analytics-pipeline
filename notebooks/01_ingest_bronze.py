@@ -1,5 +1,4 @@
 # Databricks notebook source
-
 # ─── NOTEBOOK: 01_ingest_bronze.py ───────────────────────────────────────────
 #
 # PURPOSE
@@ -10,30 +9,45 @@
 #   _ingested_at  : timestamp this record was loaded
 #   _source_file  : filename the record originated from
 #
-# ARCHITECTURE
-# ------------
-# This notebook represents the Bronze layer of the Medallion architecture.
-# Bronze = raw, immutable, append-friendly. Think of it as the audit trail.
-# Downstream Silver notebooks read from here and apply all cleansing logic.
+# SOURCE SCHEMAS (v4 datasets)
+# ----------------------------
+# ParkTech (barrier_anpr, pay_on_exit):
+#   transaction_id, site_id, site_name, vrm,
+#   entry_timestamp, exit_timestamp, transaction_time, duration_minutes,
+#   payment_method, card_scheme,
+#   gross_charge, discount_code, product_id, discount_amount,
+#   discounted_charge, vat_rate, vat_amount, amount_paid,
+#   psp, acquirer, psp_reference
 #
-# MEDALLION LAYERS
-# ----------------
-#   Bronze  (this notebook) : raw landing zone, no transforms
-#   Silver  (02_...)        : cleansed, normalised, conformed
-#   Gold    (03_...)        : aggregated analytical output, business-ready
+# VendPark (barrier_anpr, pay_on_exit, NET reporting):
+#   car_park_slug, car_park_name, txn_ref, vrm,
+#   arrival, departure, transaction_time, stay_minutes,
+#   payment_type, card_scheme,
+#   net_charge, discount_code, product_id,
+#   discounted_net, vat_rate, vat_amount, amount_paid,
+#   psp, acquirer, psp_reference
 #
-# DELTA LAKE
-# ----------
-# Tables are written as Delta format which provides:
-#   - ACID transactions     : failed writes never leave partial data
-#   - Time travel           : query any previous version with VERSION AS OF
-#   - Schema enforcement    : malformed source files are rejected, not silently loaded
+# EasyEntry (mixed: barrier_ticket and barrierless):
+#   site_uuid, site_name, id, ticket_number,
+#   entry_time, exit_time, transaction_time, duration_mins,
+#   payment_method, card_scheme,
+#   full_price, discount_code, product_id,
+#   discounted_price, vat_pct, tax_amount, charged,
+#   psp, acquirer, psp_reference
 #
-# USAGE
-# -----
-# Run cells sequentially. Widget at top allows selective reload of one provider
-# or all three. Safe to re-run: tables are overwritten in full each execution
-# (append mode with deduplication is a Silver concern, not Bronze).
+# Site map:
+#   canonical_site_id, site_name, city, capacity,
+#   site_type, payment_type, open_hour, close_hour, ticket_prefix,
+#   parktech_id, vendpark_slug, easyentry_uuid
+#
+# KEY DESIGN DECISIONS
+# --------------------
+# - All columns ingested as StringType regardless of their eventual type.
+#   Casting at ingestion would silently null or error on dirty values.
+#   Bronze preserves exactly what the source sent. Silver does all casting.
+# - enforceSchema=True rejects files that do not match the declared schema.
+# - mode=FAILFAST aborts on any malformed row rather than silently dropping.
+# - Writes use saveAsTable for Unity Catalog compatibility.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -43,48 +57,26 @@
 # MAGIC # Bronze Ingestion
 # MAGIC ## Parking Analytics Pipeline
 # MAGIC Loads raw source CSV files into Delta tables without any transformation.
-# MAGIC Re-running this notebook performs a full reload of the selected provider(s).
+# MAGIC Re-running performs a full reload of all providers.
 
 # COMMAND ----------
 
-# ─── Imports ─────────────────────────────────────────────────────────────────
-
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import current_timestamp, lit, input_file_name
-from pyspark.sql.types import (
-    StructType, StructField,
-    StringType, IntegerType
-)
+from pyspark.sql.functions import current_timestamp, lit
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType
 from datetime import datetime
 
 spark = SparkSession.builder.getOrCreate()
 
 # COMMAND ----------
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-#
-# SOURCE_BASE_PATH : where your CSV files live in DBFS or cloud storage.
-#                   In Databricks Community Edition, upload files via the
-#                   Data tab and reference them as /FileStore/tables/
-#
-# BRONZE_BASE_PATH : where Delta tables will be written.
-#
-# Adjust these paths to match your workspace setup.
-
 SOURCE_BASE_PATH = "/FileStore/tables"
-BRONZE_BASE_PATH = "/delta/bronze"
-
-# Database (schema) that will hold our Bronze tables.
-# Using a dedicated database keeps things tidy in the metastore.
-BRONZE_DATABASE = "parking_bronze"
+BRONZE_DATABASE  = "parking_bronze"
 
 print(f"Source path  : {SOURCE_BASE_PATH}")
-print(f"Bronze path  : {BRONZE_BASE_PATH}")
 print(f"Database     : {BRONZE_DATABASE}")
 
 # COMMAND ----------
-
-# ─── Create database if it does not exist ────────────────────────────────────
 
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {BRONZE_DATABASE}")
 spark.sql(f"USE {BRONZE_DATABASE}")
@@ -92,125 +84,131 @@ print(f"Using database: {BRONZE_DATABASE}")
 
 # COMMAND ----------
 
-# ─── Source file definitions ──────────────────────────────────────────────────
+# ─── Source definitions ───────────────────────────────────────────────────────
 #
-# Each entry defines one source feed. Adding a new provider in future is as
-# simple as adding a new entry to this list - the ingestion logic is generic.
-#
-# Fields:
-#   provider      : human-readable provider name (used in logging)
-#   filename      : CSV filename in the sources folder
-#   table_name    : target Bronze Delta table name
-#   schema        : explicit schema - never infer schema from raw sources.
-#                   Inference can silently miscast columns and is non-deterministic
-#                   across Spark versions. Explicit schemas are self-documenting.
+# All columns are StringType at Bronze. Dirty values (nulls, £ symbols,
+# negative numbers, mixed-case strings) are preserved exactly as received.
+# Silver handles all casting and cleansing.
+
+def str_field(name):
+    return StructField(name, StringType(), True)
 
 SOURCES = [
     {
-        "provider"   : "ParkTech",
-        "filename"   : "parktech_march_2025.csv",
-        "table_name" : "bronze_parktech",
-        "schema"     : StructType([
-            StructField("transaction_id",   StringType(),  True),
-            StructField("site_id",          StringType(),  True),
-            StructField("site_name",        StringType(),  True),
-            StructField("entry_timestamp",  StringType(),  True),  # kept as string - Silver will cast
-            StructField("exit_timestamp",   StringType(),  True),
-            StructField("duration_minutes", StringType(),  True),  # string to survive dirty nulls
-            StructField("vehicle_type",     StringType(),  True),
-            StructField("payment_method",   StringType(),  True),
-            StructField("card_scheme",      StringType(),  True),
-            StructField("charge_amount",    StringType(),  True),  # string - Silver strips £ and casts
-            StructField("discount_code",    StringType(),  True),
-            StructField("product_id",       StringType(),  True),
-            StructField("psp",              StringType(),  True),
-            StructField("acquirer",         StringType(),  True),
-            StructField("psp_reference",    StringType(),  True),
+        "provider":   "ParkTech",
+        "filename":   "parktech_march_2025.csv",
+        "table_name": "bronze_parktech",
+        "schema": StructType([
+            str_field("transaction_id"),
+            str_field("site_id"),
+            str_field("site_name"),
+            str_field("vrm"),
+            str_field("entry_timestamp"),
+            str_field("exit_timestamp"),
+            str_field("transaction_time"),
+            str_field("duration_minutes"),
+            str_field("payment_method"),
+            str_field("card_scheme"),
+            str_field("gross_charge"),        # occasionally null (dirty)
+            str_field("discount_code"),
+            str_field("product_id"),
+            str_field("discount_amount"),
+            str_field("discounted_charge"),
+            str_field("vat_rate"),
+            str_field("vat_amount"),
+            str_field("amount_paid"),
+            str_field("psp"),
+            str_field("acquirer"),
+            str_field("psp_reference"),
         ]),
     },
     {
-        "provider"   : "VendPark",
-        "filename"   : "vendpark_march_2025.csv",
-        "table_name" : "bronze_vendpark",
-        "schema"     : StructType([
-            StructField("txn_ref",          StringType(),  True),
-            StructField("car_park_slug",    StringType(),  True),
-            StructField("car_park_name",    StringType(),  True),
-            StructField("arrival",          StringType(),  True),
-            StructField("departure",        StringType(),  True),
-            StructField("stay_minutes",     StringType(),  True),
-            StructField("vehicle",          StringType(),  True),
-            StructField("payment_type",     StringType(),  True),
-            StructField("card_scheme",      StringType(),  True),
-            StructField("amount_charged",   StringType(),  True),
-            StructField("discount_code",    StringType(),  True),
-            StructField("product_id",       StringType(),  True),
-            StructField("psp",              StringType(),  True),
-            StructField("acquirer",         StringType(),  True),
-            StructField("psp_reference",    StringType(),  True),
+        "provider":   "VendPark",
+        "filename":   "vendpark_march_2025.csv",
+        "table_name": "bronze_vendpark",
+        "schema": StructType([
+            str_field("car_park_slug"),
+            str_field("car_park_name"),
+            str_field("txn_ref"),
+            str_field("vrm"),
+            str_field("arrival"),             # UK date format dd/MM/yyyy HH:mm
+            str_field("departure"),           # UK date format, some before arrival
+            str_field("transaction_time"),    # UK date format
+            str_field("stay_minutes"),        # occasionally null
+            str_field("payment_type"),        # mixed case problem
+            str_field("card_scheme"),
+            str_field("net_charge"),          # NET reporting (ex-VAT)
+            str_field("discount_code"),
+            str_field("product_id"),
+            str_field("discounted_net"),      # NET reporting
+            str_field("vat_rate"),
+            str_field("vat_amount"),
+            str_field("amount_paid"),
+            str_field("psp"),
+            str_field("acquirer"),
+            str_field("psp_reference"),
         ]),
     },
     {
-        "provider"   : "EasyEntry",
-        "filename"   : "easyentry_march_2025.csv",
-        "table_name" : "bronze_easyentry",
-        "schema"     : StructType([
-            StructField("id",               StringType(),  True),
-            StructField("site_uuid",        StringType(),  True),
-            StructField("site_name",        StringType(),  True),
-            StructField("entry_time",       StringType(),  True),
-            StructField("exit_time",        StringType(),  True),
-            StructField("duration_mins",    StringType(),  True),
-            StructField("vehicle_class",    StringType(),  True),
-            StructField("payment_method",   StringType(),  True),
-            StructField("card_scheme",      StringType(),  True),
-            StructField("charge",           StringType(),  True),
-            StructField("discount_code",    StringType(),  True),
-            StructField("product_id",       StringType(),  True),
-            StructField("psp",              StringType(),  True),
-            StructField("acquirer",         StringType(),  True),
-            StructField("psp_reference",    StringType(),  True),
+        "provider":   "EasyEntry",
+        "filename":   "easyentry_march_2025.csv",
+        "table_name": "bronze_easyentry",
+        "schema": StructType([
+            str_field("site_uuid"),
+            str_field("site_name"),
+            str_field("id"),
+            str_field("ticket_number"),       # populated for barrier_ticket sites only
+            str_field("entry_time"),          # empty for barrierless sites
+            str_field("exit_time"),           # empty for barrierless, occasionally missing
+            str_field("transaction_time"),
+            str_field("duration_mins"),       # empty for barrierless, occasionally negative
+            str_field("payment_method"),
+            str_field("card_scheme"),
+            str_field("full_price"),          # £ symbol present (e.g. "£5.00")
+            str_field("discount_code"),
+            str_field("product_id"),
+            str_field("discounted_price"),    # £ symbol present
+            str_field("vat_pct"),             # integer string "20" not decimal
+            str_field("tax_amount"),          # £ symbol present
+            str_field("charged"),             # £ symbol present
+            str_field("psp"),
+            str_field("acquirer"),
+            str_field("psp_reference"),
         ]),
     },
     {
-        "provider"   : "SiteMap",
-        "filename"   : "site_map.csv",
-        "table_name" : "bronze_site_map",
-        "schema"     : StructType([
-            StructField("canonical_site_id", StringType(), True),
-            StructField("site_name",         StringType(), True),
-            StructField("city",              StringType(), True),
-            StructField("capacity",          StringType(), True),  # string for safety
-            StructField("parktech_id",       StringType(), True),
-            StructField("vendpark_slug",     StringType(), True),
-            StructField("easyentry_uuid",    StringType(), True),
+        "provider":   "SiteMap",
+        "filename":   "site_map.csv",
+        "table_name": "bronze_site_map",
+        "schema": StructType([
+            str_field("canonical_site_id"),
+            str_field("site_name"),
+            str_field("city"),
+            str_field("capacity"),
+            str_field("site_type"),           # barrier_anpr / barrier_ticket / barrierless
+            str_field("payment_type"),        # pay_on_exit / prepay
+            str_field("open_hour"),           # populated for time-bounded sites only
+            str_field("close_hour"),          # populated for time-bounded sites only
+            str_field("ticket_prefix"),       # populated for barrier_ticket sites only
+            str_field("parktech_id"),
+            str_field("vendpark_slug"),
+            str_field("easyentry_uuid"),
         ]),
     },
 ]
 
 # COMMAND ----------
 
-# ─── Ingestion function ───────────────────────────────────────────────────────
-
 def ingest_to_bronze(source: dict) -> None:
     """
     Reads a single source CSV into a Bronze Delta table.
 
-    Design decisions:
-    - header=True        : first row is column names
-    - enforceSchema=True : rejects files that do not match the declared schema
-                           rather than silently loading garbage
-    - mode="FAILFAST"    : aborts on any malformed row rather than silently
-                           dropping it. In production you would catch this
-                           exception and raise an alert.
-    - overwrite          : Bronze is a full reload pattern. Incremental loading
-                           (mergeSchema, MERGE INTO) is a Silver concern once
-                           data is trusted.
+    Uses saveAsTable for Unity Catalog compatibility.
+    Overwrites on every run - Bronze is a full reload pattern.
+    Incremental loading is a Silver concern once data is trusted.
     """
-
-    file_path = f"{SOURCE_BASE_PATH}/{source['filename']}"
+    file_path  = f"{SOURCE_BASE_PATH}/{source['filename']}"
     table_name = source["table_name"]
-    delta_path = f"{BRONZE_BASE_PATH}/{table_name}"
 
     print(f"\n[{source['provider']}] Reading from : {file_path}")
 
@@ -218,25 +216,22 @@ def ingest_to_bronze(source: dict) -> None:
         df = (
             spark.read
             .format("csv")
-            .option("header", "true")
+            .option("header",        "true")
             .option("enforceSchema", "true")
-            .option("mode", "FAILFAST")
+            .option("mode",          "FAILFAST")
             .schema(source["schema"])
             .load(file_path)
         )
 
-        # Append audit columns - these are pipeline metadata, not source data
         df = (
             df
-            .withColumn("_ingested_at",  current_timestamp())
-            .withColumn("_source_file",  lit(source["filename"]))
+            .withColumn("_ingested_at", current_timestamp())
+            .withColumn("_source_file", lit(source["filename"]))
         )
 
         row_count = df.count()
         print(f"[{source['provider']}] Rows read    : {row_count:,}")
 
-        # Write as a managed Unity Catalog table
-        # Unity Catalog handles storage location automatically
         (
             df.write
             .format("delta")
@@ -245,17 +240,13 @@ def ingest_to_bronze(source: dict) -> None:
             .saveAsTable(f"{BRONZE_DATABASE}.{table_name}")
         )
 
-        print(f"[{source['provider']}] Written to  : {delta_path}")
-        print(f"[{source['provider']}] Table       : {BRONZE_DATABASE}.{table_name}  DONE")
+        print(f"[{source['provider']}] Table        : {BRONZE_DATABASE}.{table_name}  DONE")
 
     except Exception as e:
         print(f"[{source['provider']}] FAILED: {e}")
         raise
 
-
 # COMMAND ----------
-
-# ─── Run ingestion for all sources ───────────────────────────────────────────
 
 run_start = datetime.now()
 print(f"Bronze ingestion started : {run_start.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -264,23 +255,15 @@ print("=" * 60)
 for source in SOURCES:
     ingest_to_bronze(source)
 
-run_end = datetime.now()
-elapsed = (run_end - run_start).seconds
-
+elapsed = (datetime.now() - run_start).seconds
 print("\n" + "=" * 60)
-print(f"Bronze ingestion complete : {run_end.strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"Bronze ingestion complete : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print(f"Elapsed                   : {elapsed}s")
 
 # COMMAND ----------
 
-# ─── Verification ─────────────────────────────────────────────────────────────
-#
-# Always verify after loading. Never assume a write succeeded just because
-# no exception was raised. Check the row counts match what you expect.
-
 print("\nVerification - Bronze table row counts:")
-print("-" * 45)
-
+print("-" * 50)
 for source in SOURCES:
     table = f"{BRONZE_DATABASE}.{source['table_name']}"
     count = spark.table(table).count()
@@ -288,32 +271,49 @@ for source in SOURCES:
 
 # COMMAND ----------
 
-# ─── Quick data peek ─────────────────────────────────────────────────────────
+# ─── Data peek ────────────────────────────────────────────────────────────────
 #
-# Eyeball the raw data to confirm it landed as expected.
-# The dirty data should be visible here - that is intentional.
-# Cleaning happens in Silver, not here.
+# All dirty data should be visible here. This is intentional.
+# - ParkTech : occasional null gross_charge, UNKNOWN payment_method,
+#              duplicate transaction_ids, VRM with ~5-10% null
+# - VendPark : mixed-case payment_type, UK dates, VP- transaction refs,
+#              NET financial values, VRM with ~5-10% null
+# - EasyEntry: £ symbol on price fields, integer vat_pct,
+#              ticket_number on barrier sites, empty entry/exit on barrierless
 
-print("\nSample rows - ParkTech (raw, faults visible):")
-spark.table(f"{BRONZE_DATABASE}.bronze_parktech").show(5, truncate=False)
+print("\nParkTech sample (financial fields, VRM):")
+spark.table(f"{BRONZE_DATABASE}.bronze_parktech") \
+    .select("transaction_id","vrm","entry_timestamp","payment_method",
+            "gross_charge","discount_code","discount_amount",
+            "discounted_charge","vat_rate","vat_amount","amount_paid") \
+    .show(5, truncate=False)
 
-print("\nSample rows - VendPark (note UK date format and mixed-case payment_type):")
-spark.table(f"{BRONZE_DATABASE}.bronze_vendpark").show(5, truncate=False)
+print("\nVendPark sample (NET financials, mixed-case payment_type, UK dates):")
+spark.table(f"{BRONZE_DATABASE}.bronze_vendpark") \
+    .select("txn_ref","vrm","arrival","departure","payment_type",
+            "net_charge","discount_code","discounted_net","vat_amount","amount_paid") \
+    .show(5, truncate=False)
 
-print("\nSample rows - EasyEntry (note £ symbol in charge column):")
-spark.table(f"{BRONZE_DATABASE}.bronze_easyentry").show(5, truncate=False)
+print("\nEasyEntry barrier_ticket sample (ticket_number, £ prices):")
+spark.table(f"{BRONZE_DATABASE}.bronze_easyentry") \
+    .filter("ticket_number != ''") \
+    .select("id","site_name","ticket_number","entry_time","exit_time",
+            "full_price","discounted_price","vat_pct","tax_amount","charged") \
+    .show(5, truncate=False)
+
+print("\nEasyEntry barrierless sample (no entry/exit/duration):")
+spark.table(f"{BRONZE_DATABASE}.bronze_easyentry") \
+    .filter("entry_time = ''") \
+    .select("id","site_name","transaction_time",
+            "full_price","discounted_price","vat_pct","charged") \
+    .show(5, truncate=False)
 
 print("\nSite map:")
-spark.table(f"{BRONZE_DATABASE}.bronze_site_map").show(10, truncate=False)
+spark.table(f"{BRONZE_DATABASE}.bronze_site_map").show(truncate=False)
 
 # COMMAND ----------
 
-# ─── Delta table history ─────────────────────────────────────────────────────
-#
-# Delta keeps a transaction log of every write. This is one of the key
-# advantages over plain Parquet. You can audit every load and roll back
-# to any previous version with:
-#   spark.read.format("delta").option("versionAsOf", 0).load(path)
+# ─── Delta transaction log ────────────────────────────────────────────────────
 
 print("\nDelta transaction log - ParkTech Bronze:")
-spark.sql(f"DESCRIBE HISTORY {BRONZE_DATABASE}.bronze_parktech").show(5, truncate=False)
+spark.sql(f"DESCRIBE HISTORY {BRONZE_DATABASE}.bronze_parktech").show(3, truncate=False)

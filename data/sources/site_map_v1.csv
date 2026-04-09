@@ -1,0 +1,11 @@
+canonical_site_id,site_name,city,capacity,parktech_id,vendpark_slug,easyentry_uuid
+SITE-001,Castle Street Multi-Storey,Brighton,480,PT-1001,,
+SITE-002,Central Station NCP,Brighton,620,PT-1003,,
+SITE-003,Airport Express Park,Gatwick,900,PT-1005,,
+SITE-004,Riverside Retail Park,Brighton,320,,riverside-retail,
+SITE-005,Westgate Shopping,Brighton,410,,westgate-shopping,
+SITE-006,Victoria Quarter,Brighton,240,,victoria-quarter,
+SITE-007,Seafront Long Stay,Brighton,200,,,3a1b2c3d-4e5f-6789-abcd-ef0123456701
+SITE-008,The Lanes Short Stay,Brighton,160,,,3a1b2c3d-4e5f-6789-abcd-ef0123456702
+SITE-009,Harbour View,Brighton,120,,,3a1b2c3d-4e5f-6789-abcd-ef0123456703
+SITE-010,North Street Surface,Brighton,80,,,3a1b2c3d-4e5f-6789-abcd-ef0123456704

@@ -1,11 +1,11 @@
-canonical_site_id,site_name,city,capacity,parktech_id,vendpark_slug,easyentry_uuid
-SITE-001,Castle Street Multi-Storey,Brighton,480,PT-1001,,
-SITE-002,Central Station NCP,Brighton,620,PT-1003,,
-SITE-003,Airport Express Park,Gatwick,900,PT-1005,,
-SITE-004,Riverside Retail Park,Brighton,320,,riverside-retail,
-SITE-005,Westgate Shopping,Brighton,410,,westgate-shopping,
-SITE-006,Victoria Quarter,Brighton,240,,victoria-quarter,
-SITE-007,Seafront Long Stay,Brighton,200,,,3a1b2c3d-4e5f-6789-abcd-ef0123456701
-SITE-008,The Lanes Short Stay,Brighton,160,,,3a1b2c3d-4e5f-6789-abcd-ef0123456702
-SITE-009,Harbour View,Brighton,120,,,3a1b2c3d-4e5f-6789-abcd-ef0123456703
-SITE-010,North Street Surface,Brighton,80,,,3a1b2c3d-4e5f-6789-abcd-ef0123456704
+canonical_site_id,site_name,city,capacity,site_type,payment_type,open_hour,close_hour,ticket_prefix,parktech_id,vendpark_slug,easyentry_uuid
+SITE-001,Castle Street Multi-Storey,Brighton,480,barrier_anpr,pay_on_exit,,,,PT-1001,,
+SITE-002,Central Station NCP,Brighton,620,barrier_anpr,pay_on_exit,,,,PT-1003,,
+SITE-003,Airport Express Park,Gatwick,900,barrier_anpr,pay_on_exit,,,,PT-1005,,
+SITE-004,Riverside Retail Park,Brighton,320,barrier_anpr,pay_on_exit,,,,,riverside-retail,
+SITE-005,Westgate Shopping,Brighton,410,barrier_anpr,pay_on_exit,,,,,westgate-shopping,
+SITE-006,Victoria Quarter,Brighton,240,barrier_anpr,pay_on_exit,,,,,victoria-quarter,
+SITE-007,Seafront Long Stay,Brighton,200,barrier_ticket,pay_on_exit,,,SLS,,,3a1b2c3d-4e5f-6789-abcd-ef0123456701
+SITE-008,The Lanes Short Stay,Brighton,160,barrierless,prepay,8,18,,,,3a1b2c3d-4e5f-6789-abcd-ef0123456702
+SITE-009,Harbour View,Brighton,120,barrier_ticket,pay_on_exit,,,HV,,,3a1b2c3d-4e5f-6789-abcd-ef0123456703
+SITE-010,North Street Surface,Brighton,80,barrierless,prepay,6,20,,,,3a1b2c3d-4e5f-6789-abcd-ef0123456704

@@ -1,54 +1,54 @@
 # Databricks notebook source
-
 # ─── NOTEBOOK: 02_transform_silver.py ────────────────────────────────────────
 #
 # PURPOSE
 # -------
 # Read raw Bronze Delta tables and produce clean, conformed Silver tables.
-# Each provider gets its own Silver table first (provider-specific cleansing),
-# then all three are written to a unified Silver table ready for Gold.
 #
 # WHAT THIS NOTEBOOK DOES
 # -----------------------
 # 1. CLEANSE   : Fix provider-specific data quality problems
-#                - ParkTech  : null charge_amount, UNKNOWN payment_method,
-#                              duplicate transaction_ids
-#                - VendPark  : mixed-case payment_type, UK date format,
-#                              exit before entry, null duration
-#                - EasyEntry : £ symbol in charge, missing exit_time,
-#                              negative duration
+#                ParkTech  : null gross_charge, UNKNOWN payment_method,
+#                            duplicate transaction_ids
+#                VendPark  : mixed-case payment_type, UK date format,
+#                            exit before entry, null duration
+#                EasyEntry : £ symbol on all price fields, vat_pct as integer
+#                            string, missing exit/entry on barrierless sites,
+#                            negative duration on barrier sites
 #
-# 2. CONFORM   : Rename all columns to a single canonical schema so all
-#                three providers look identical downstream
+# 2. CONFORM   : Rename all columns to canonical schema. Normalise VendPark
+#                NET financials to GROSS basis. Derive discount_amount for
+#                VendPark and EasyEntry. Compute canonical net financial fields
+#                for all providers.
 #
-# 3. ENRICH    : Join to the site map to resolve provider-specific site
-#                identifiers to a canonical_site_id (SITE-001 etc.)
+# 3. ENRICH    : Join to site map for canonical_site_id, site_type,
+#                payment_type, open/close hours, ticket_prefix.
 #
-# 4. UNIFY     : Union all three conformed datasets into one Silver table
+# 4. UNIFY     : Union all three providers into one Silver table.
 #
-# CANONICAL SCHEMA (output of this notebook)
-# ------------------------------------------
-#   transaction_id    : string  - unique transaction reference
-#   canonical_site_id : string  - SITE-001 through SITE-010
-#   site_name         : string  - human readable site name
-#   city              : string  - city from site map
-#   capacity          : integer - car park capacity from site map
-#   entry_timestamp   : timestamp
-#   exit_timestamp    : timestamp  (null if missing)
-#   duration_minutes  : integer    (null if invalid)
-#   vehicle_type      : string
-#   payment_method    : string  - normalised to UPPER_SNAKE_CASE
-#   card_scheme       : string
-#   charge_amount     : double  - always numeric, never null (0.0 for free)
-#   discount_code     : string  - null if no discount
-#   product_id        : string  - null if no discount
-#   psp               : string
-#   acquirer          : string
-#   psp_reference     : string
-#   provider          : string  - PARKTECH, VENDPARK, EASYENTRY
-#   _ingested_at      : timestamp - carried from Bronze
-#   _source_file      : string    - carried from Bronze
-#   _cleansed_at      : timestamp - added by this notebook
+# FINANCIAL NORMALISATION
+# -----------------------
+# All providers are normalised to the same financial schema regardless of
+# whether the source reported gross or net:
+#
+#   gross_charge         : full undiscounted tariff, VAT inclusive
+#   discount_amount      : value of discount, VAT inclusive
+#   discounted_gross     : gross_charge minus discount_amount
+#   vat_rate             : decimal (0.20)
+#   vat_amount           : VAT element of discounted_gross
+#   net_charge           : gross_charge / 1.20  (pre-discount, ex-VAT)
+#   net_discount_amount  : discount_amount / 1.20
+#   net_amount_paid      : discounted_gross / 1.20
+#   amount_paid          : discounted_gross (VAT inclusive)
+#
+# VendPark reports NET. Silver converts to gross before populating this schema:
+#   gross = net * 1.20
+#
+# DURATION FIELDS
+# ---------------
+#   duration_minutes      : actual measured duration (barrier sites only)
+#   paid_duration_minutes : maximum of gross tariff band paid (barrierless only)
+#                           reflects entitlement granted before any discount
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -57,18 +57,17 @@
 # MAGIC %md
 # MAGIC # Silver Transformation
 # MAGIC ## Parking Analytics Pipeline
-# MAGIC Cleanses, conforms, and enriches Bronze data into a unified Silver table.
+# MAGIC Cleanses, conforms, normalises financials, and enriches Bronze data
+# MAGIC into a unified Silver table.
 
 # COMMAND ----------
-
-# ─── Imports ─────────────────────────────────────────────────────────────────
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
     col, lit, upper, trim, regexp_replace,
     to_timestamp, when, abs as spark_abs,
-    current_timestamp, coalesce, count,
-    row_number
+    current_timestamp, coalesce, round as spark_round,
+    row_number, sum as spark_sum
 )
 from pyspark.sql.types import DoubleType, IntegerType
 from pyspark.sql.window import Window
@@ -77,28 +76,51 @@ spark = SparkSession.builder.getOrCreate()
 
 # COMMAND ----------
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-
 BRONZE_DATABASE = "parking_bronze"
 SILVER_DATABASE = "parking_silver"
+VAT_RATE        = 0.20
+VAT_DIVISOR     = 1 + VAT_RATE
 
 print(f"Reading from : {BRONZE_DATABASE}")
 print(f"Writing to   : {SILVER_DATABASE}")
+print(f"VAT rate     : {VAT_RATE}")
 
 # COMMAND ----------
 
-# ─── Create Silver database ───────────────────────────────────────────────────
+# ─── Tariff band maximums for paid_duration_minutes ───────────────────────────
+#
+# Barrierless sites: paid_duration_minutes = maximum minutes of the gross
+# tariff band the customer paid for. Reflects entitlement before any discount.
+
+TARIFF_BANDS = {
+    "3a1b2c3d-4e5f-6789-abcd-ef0123456702": [  # The Lanes Short Stay
+        (60, 1.50), (120, 2.50), (240, 4.00),
+        (360, 5.50), (720, 7.50), (1440, 11.00)
+    ],
+    "3a1b2c3d-4e5f-6789-abcd-ef0123456704": [  # North Street Surface
+        (60, 1.00), (120, 2.00), (240, 3.00),
+        (360, 4.00), (720, 6.00), (1440, 8.00)
+    ],
+}
+
+def build_paid_duration_expr(site_uuid_col, gross_charge_col):
+    expr = lit(None).cast(IntegerType())
+    for site_id, bands in TARIFF_BANDS.items():
+        for (max_min, price) in bands:
+            expr = when(
+                (col(site_uuid_col) == site_id) &
+                (col(gross_charge_col) == price),
+                max_min
+            ).otherwise(expr)
+    return expr
+
+# COMMAND ----------
 
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {SILVER_DATABASE}")
 spark.sql(f"USE {SILVER_DATABASE}")
 print(f"Using database: {SILVER_DATABASE}")
 
 # COMMAND ----------
-
-# ─── Load Bronze tables ───────────────────────────────────────────────────────
-#
-# Always read from Bronze, never from the source CSV directly.
-# Bronze is your immutable record of what arrived. Silver reads from that.
 
 bronze_parktech  = spark.table(f"{BRONZE_DATABASE}.bronze_parktech")
 bronze_vendpark  = spark.table(f"{BRONZE_DATABASE}.bronze_vendpark")
@@ -113,11 +135,6 @@ print(f"  Site map  : {bronze_site_map.count():,} rows")
 
 # COMMAND ----------
 
-# ─── Prepare site map for joins ───────────────────────────────────────────────
-#
-# Cast capacity to integer now that we trust the source is clean.
-# We will join this three times (once per provider) using different key columns.
-
 site_map = (
     bronze_site_map
     .select(
@@ -125,6 +142,11 @@ site_map = (
         col("site_name").alias("canonical_site_name"),
         col("city"),
         col("capacity").cast(IntegerType()).alias("capacity"),
+        col("site_type"),
+        col("payment_type").alias("site_payment_type"),
+        col("open_hour").cast(IntegerType()).alias("open_hour"),
+        col("close_hour").cast(IntegerType()).alias("close_hour"),
+        col("ticket_prefix"),
         col("parktech_id"),
         col("vendpark_slug"),
         col("easyentry_uuid"),
@@ -139,33 +161,14 @@ site_map.show(truncate=False)
 # MAGIC %md
 # MAGIC ## Provider 1: ParkTech Cleansing
 # MAGIC
-# MAGIC **Problems to fix:**
-# MAGIC - `charge_amount` : occasionally null - default to 0.0
-# MAGIC - `payment_method`: occasionally "UNKNOWN" - set to null (unknown is not a method)
-# MAGIC - `transaction_id` : occasional duplicates - keep first occurrence only
-# MAGIC - `duration_minutes`: already integer-compatible strings, just cast
-# MAGIC - Timestamps       : ISO 8601 format, straightforward to cast
+# MAGIC Source reports GROSS (VAT inclusive). `discount_amount` is explicit.
+# MAGIC Net fields derived by dividing gross by 1.20.
 
 # COMMAND ----------
 
 def cleanse_parktech(df: DataFrame, site_map: DataFrame) -> DataFrame:
-    """
-    Cleanses ParkTech Bronze data and conforms to canonical Silver schema.
 
-    Key decisions:
-    - Duplicate transaction_ids: we keep the first occurrence ordered by
-      entry_timestamp. In production this decision would be documented
-      and signed off by the business. We never silently drop rows without
-      a documented reason.
-    - UNKNOWN payment_method: replaced with null rather than a default value.
-      Null is honest. Inventing a value would corrupt downstream analysis.
-    - Null charge_amount: defaulted to 0.0. A null charge on a real transaction
-      is more likely a data feed issue than a genuinely free transaction.
-      Free transactions have an explicit discount code. We flag these rows
-      with a note in a real system; here we default and document.
-    """
-
-    # Step 1: Deduplicate on transaction_id, keep earliest entry
+    # Deduplicate on transaction_id - keep earliest entry
     window = Window.partitionBy("transaction_id").orderBy("entry_timestamp")
     df = (
         df
@@ -174,70 +177,95 @@ def cleanse_parktech(df: DataFrame, site_map: DataFrame) -> DataFrame:
         .drop("_row_num")
     )
 
-    # Step 2: Cast and cleanse
     df = (
         df
-        .withColumn(
-            "charge_amount",
-            coalesce(
-                col("charge_amount").cast(DoubleType()),
-                lit(0.0)                                    # null charge -> 0.0
-            )
-        )
+        .withColumn("entry_timestamp",  to_timestamp(col("entry_timestamp"),  "yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        .withColumn("exit_timestamp",   to_timestamp(col("exit_timestamp"),   "yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        .withColumn("transaction_time", to_timestamp(col("transaction_time"), "yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        .withColumn("duration_minutes", col("duration_minutes").cast(IntegerType()))
         .withColumn(
             "payment_method",
-            when(col("payment_method") == "UNKNOWN", None)  # UNKNOWN -> null
+            when(col("payment_method") == "UNKNOWN", None)
             .otherwise(upper(trim(col("payment_method"))))
-        )
-        .withColumn(
-            "duration_minutes",
-            col("duration_minutes").cast(IntegerType())
-        )
-        .withColumn(
-            "entry_timestamp",
-            to_timestamp(col("entry_timestamp"), "yyyy-MM-dd'T'HH:mm:ss'Z'")
-        )
-        .withColumn(
-            "exit_timestamp",
-            to_timestamp(col("exit_timestamp"), "yyyy-MM-dd'T'HH:mm:ss'Z'")
         )
     )
 
-    # Step 3: Join to site map on ParkTech site_id
+    # Financial - GROSS source
+    df = (
+        df
+        .withColumn("gross_charge_raw",
+            col("gross_charge").cast(DoubleType()))
+        .withColumn("gross_charge",
+            col("gross_charge_raw"))
+        .withColumn("discount_amount",
+            when(col("gross_charge").isNull(), None)
+            .otherwise(col("discount_amount").cast(DoubleType())))
+        .withColumn("discounted_gross",
+            when(col("gross_charge").isNull(), None)
+            .otherwise(col("discounted_charge").cast(DoubleType())))
+        .withColumn("vat_rate",
+            when(col("gross_charge").isNull(), None)
+            .otherwise(col("vat_rate").cast(DoubleType())))
+        .withColumn("vat_amount",
+            when(col("gross_charge").isNull(), None)
+            .otherwise(col("vat_amount").cast(DoubleType())))
+        .withColumn("amount_paid",
+            when(col("gross_charge").isNull(), None)
+            .otherwise(col("amount_paid").cast(DoubleType())))
+        .withColumn("net_charge",
+            when(col("gross_charge").isNull(), None)
+            .otherwise(spark_round(col("gross_charge") / VAT_DIVISOR, 2)))
+        .withColumn("net_discount_amount",
+            when(col("gross_charge").isNull(), None)
+            .otherwise(spark_round(col("discount_amount") / VAT_DIVISOR, 2)))
+        .withColumn("net_amount_paid",
+            when(col("gross_charge").isNull(), None)
+            .otherwise(spark_round(col("amount_paid") / VAT_DIVISOR, 2)))
+    )
+
     df = df.join(
-        site_map.select("canonical_site_id", "canonical_site_name", "city", "capacity", "parktech_id"),
+        site_map.select("canonical_site_id","canonical_site_name","city","capacity",
+                        "site_type","site_payment_type","parktech_id"),
         df["site_id"] == site_map["parktech_id"],
         how="left"
     )
 
-    # Step 4: Conform to canonical schema
-    return (
-        df
-        .select(
-            col("transaction_id"),
-            col("canonical_site_id"),
-            col("canonical_site_name").alias("site_name"),
-            col("city"),
-            col("capacity"),
-            col("entry_timestamp"),
-            col("exit_timestamp"),
-            col("duration_minutes"),
-            col("vehicle_type"),
-            col("payment_method"),
-            col("card_scheme"),
-            col("charge_amount"),
-            col("discount_code"),
-            col("product_id"),
-            col("psp"),
-            col("acquirer"),
-            col("psp_reference"),
-            lit("PARKTECH").alias("provider"),
-            col("_ingested_at"),
-            col("_source_file"),
-            current_timestamp().alias("_cleansed_at"),
-        )
+    return df.select(
+        col("transaction_id"),
+        col("canonical_site_id"),
+        col("canonical_site_name").alias("site_name"),
+        col("city"),
+        col("capacity"),
+        col("site_type"),
+        col("site_payment_type").alias("payment_type"),
+        col("vrm"),
+        lit(None).cast("string").alias("ticket_number"),
+        col("entry_timestamp"),
+        col("exit_timestamp"),
+        col("transaction_time"),
+        col("duration_minutes"),
+        lit(None).cast(IntegerType()).alias("paid_duration_minutes"),
+        col("payment_method"),
+        col("card_scheme"),
+        col("gross_charge"),
+        col("discount_code"),
+        col("product_id"),
+        col("discount_amount"),
+        col("discounted_gross"),
+        col("vat_rate"),
+        col("vat_amount"),
+        col("net_charge"),
+        col("net_discount_amount"),
+        col("net_amount_paid"),
+        col("amount_paid"),
+        col("psp"),
+        col("acquirer"),
+        col("psp_reference"),
+        lit("PARKTECH").alias("provider"),
+        col("_ingested_at"),
+        col("_source_file"),
+        current_timestamp().alias("_cleansed_at"),
     )
-
 
 silver_parktech = cleanse_parktech(bronze_parktech, site_map)
 print(f"ParkTech Silver : {silver_parktech.count():,} rows")
@@ -247,132 +275,128 @@ print(f"ParkTech Silver : {silver_parktech.count():,} rows")
 # MAGIC %md
 # MAGIC ## Provider 2: VendPark Cleansing
 # MAGIC
-# MAGIC **Problems to fix:**
-# MAGIC - `payment_type`  : mixed case (DEBIT_CARD, debit_card, Debit_Card) - normalise to UPPER_SNAKE_CASE
-# MAGIC - `arrival`       : UK date format dd/MM/yyyy HH:mm - parse correctly
-# MAGIC - `departure`     : same as arrival, plus some exit before entry - set those to null
-# MAGIC - `stay_minutes`  : occasionally null - recalculate from timestamps where possible
-# MAGIC - `amount_charged`: already numeric string, just cast
+# MAGIC Source reports NET (VAT exclusive). Convert to GROSS: gross = net * 1.20.
+# MAGIC discount_amount derived from net_charge minus discounted_net, then grossed up.
 
 # COMMAND ----------
 
 def cleanse_vendpark(df: DataFrame, site_map: DataFrame) -> DataFrame:
-    """
-    Cleanses VendPark Bronze data and conforms to canonical Silver schema.
 
-    Key decisions:
-    - Mixed case payment_type: upper() + trim() + replace spaces with underscore
-      handles all variants cleanly.
-    - Exit before entry: these rows have an impossible duration. We set
-      exit_timestamp to null and duration to null rather than dropping the row.
-      The transaction still happened, the timestamps are just unreliable.
-    - Null duration: where we have valid entry and exit timestamps we
-      recalculate duration. Where we cannot, we leave as null.
-    - UK date format: to_timestamp with explicit format pattern. If the
-      pattern does not match, Spark returns null rather than throwing,
-      which is safe behaviour.
-    """
-
-    # Step 1: Normalise payment_type to UPPER_SNAKE_CASE
-    # Handles: "debit_card", "Debit_Card", "DEBIT CARD", "Debit Card" etc.
     df = df.withColumn(
         "payment_type_clean",
-        upper(
-            regexp_replace(
-                trim(col("payment_type")),
-                r"[\s]+", "_"               # spaces to underscores
-            )
-        )
+        upper(regexp_replace(trim(col("payment_type")), r"[\s]+", "_"))
     )
 
-    # Step 2: Parse UK format timestamps
     df = (
         df
-        .withColumn(
-            "entry_timestamp",
-            to_timestamp(col("arrival"), "dd/MM/yyyy HH:mm")
-        )
-        .withColumn(
-            "exit_timestamp_raw",
-            to_timestamp(col("departure"), "dd/MM/yyyy HH:mm")
-        )
+        .withColumn("entry_timestamp",    to_timestamp(col("arrival"),          "dd/MM/yyyy HH:mm"))
+        .withColumn("exit_timestamp_raw", to_timestamp(col("departure"),        "dd/MM/yyyy HH:mm"))
+        .withColumn("transaction_time",   to_timestamp(col("transaction_time"), "dd/MM/yyyy HH:mm"))
     )
 
-    # Step 3: Fix exit before entry - set exit and duration to null
-    df = (
-        df
-        .withColumn(
-            "exit_timestamp",
-            when(
-                col("exit_timestamp_raw") < col("entry_timestamp"),
-                None                        # impossible - nullify
-            ).otherwise(col("exit_timestamp_raw"))
-        )
+    df = df.withColumn(
+        "exit_timestamp",
+        when(col("exit_timestamp_raw") < col("entry_timestamp"), None)
+        .otherwise(col("exit_timestamp_raw"))
     )
 
-    # Step 4: Recalculate duration where possible
-    # If stay_minutes is null but we have valid timestamps, derive it.
-    # Cast to integer first, negative or blank becomes null.
     df = (
         df
-        .withColumn(
-            "duration_raw",
-            col("stay_minutes").cast(IntegerType())
-        )
+        .withColumn("duration_raw", col("stay_minutes").cast(IntegerType()))
         .withColumn(
             "duration_minutes",
-            when(
-                col("duration_raw").isNotNull() & (col("duration_raw") > 0),
-                col("duration_raw")
-            ).when(
+            when(col("duration_raw").isNotNull() & (col("duration_raw") > 0), col("duration_raw"))
+            .when(
                 col("exit_timestamp").isNotNull() & col("entry_timestamp").isNotNull(),
                 ((col("exit_timestamp").cast("long") - col("entry_timestamp").cast("long")) / 60)
-                .cast(IntegerType())        # recalculate from timestamps
+                .cast(IntegerType())
             ).otherwise(None)
         )
     )
 
-    # Step 5: Cast charge
-    df = df.withColumn(
-        "charge_amount",
-        col("amount_charged").cast(DoubleType())
-    )
+    # Rename source columns that conflict with canonical output names
+    df = df \
+        .withColumnRenamed("net_charge",     "src_net") \
+        .withColumnRenamed("discounted_net", "src_disc_net") \
+        .withColumnRenamed("vat_rate",       "src_vat_rate") \
+        .withColumnRenamed("vat_amount",     "src_vat_amount") \
+        .withColumnRenamed("amount_paid",    "src_amount_paid")
 
-    # Step 6: Join to site map on VendPark slug
+    # Cast source values
+    df = df.withColumn("src_net",      col("src_net").cast(DoubleType()))
+    df = df.withColumn("src_disc_net", col("src_disc_net").cast(DoubleType()))
+
+    # Step 1: Gross from net
+    df = df.withColumn("gross_charge",
+        spark_round(col("src_net") * VAT_DIVISOR, 2))
+
+    # Step 2: Discount amount and discounted gross on gross basis
+    df = df.withColumn("discount_amount",
+        spark_round(
+            col("gross_charge") * (lit(1.0) - col("src_disc_net") / col("src_net")),
+            2
+        ))
+    df = df.withColumn("discounted_gross",
+        spark_round(col("gross_charge") - col("discount_amount"), 2))
+
+    # Step 3: VAT extracted first, net derived by subtraction
+    df = df.withColumn("vat_rate",    lit(VAT_RATE))
+    df = df.withColumn("vat_amount",
+        spark_round(col("discounted_gross") - col("discounted_gross") / VAT_DIVISOR, 2))
+    df = df.withColumn("net_amount_paid",
+        col("discounted_gross") - col("vat_amount"))
+    df = df.withColumn("vat_on_gross",
+        spark_round(col("gross_charge") - col("gross_charge") / VAT_DIVISOR, 2))
+    df = df.withColumn("net_charge",
+        col("gross_charge") - col("vat_on_gross"))
+    df = df.withColumn("net_discount_amount",
+        spark_round(col("discount_amount") - col("discount_amount") / VAT_DIVISOR, 2))
+    df = df.withColumn("amount_paid", col("discounted_gross"))
+
+    # Join to site map
     df = df.join(
-        site_map.select("canonical_site_id", "canonical_site_name", "city", "capacity", "vendpark_slug"),
+        site_map.select("canonical_site_id","canonical_site_name","city","capacity",
+                        "site_type","site_payment_type","vendpark_slug"),
         df["car_park_slug"] == site_map["vendpark_slug"],
         how="left"
     )
 
-    # Step 7: Conform to canonical schema
-    return (
-        df
-        .select(
-            col("txn_ref").alias("transaction_id"),
-            col("canonical_site_id"),
-            col("canonical_site_name").alias("site_name"),
-            col("city"),
-            col("capacity"),
-            col("entry_timestamp"),
-            col("exit_timestamp"),
-            col("duration_minutes"),
-            col("vehicle").alias("vehicle_type"),
-            col("payment_type_clean").alias("payment_method"),
-            col("card_scheme"),
-            col("charge_amount"),
-            col("discount_code"),
-            col("product_id"),
-            col("psp"),
-            col("acquirer"),
-            col("psp_reference"),
-            lit("VENDPARK").alias("provider"),
-            col("_ingested_at"),
-            col("_source_file"),
-            current_timestamp().alias("_cleansed_at"),
-        )
+    return df.select(
+        col("txn_ref").alias("transaction_id"),
+        col("canonical_site_id"),
+        col("canonical_site_name").alias("site_name"),
+        col("city"),
+        col("capacity"),
+        col("site_type"),
+        col("site_payment_type").alias("payment_type"),
+        col("vrm"),
+        lit(None).cast("string").alias("ticket_number"),
+        col("entry_timestamp"),
+        col("exit_timestamp"),
+        col("transaction_time"),
+        col("duration_minutes"),
+        lit(None).cast(IntegerType()).alias("paid_duration_minutes"),
+        col("payment_type_clean").alias("payment_method"),
+        col("card_scheme"),
+        col("gross_charge"),
+        col("discount_code"),
+        col("product_id"),
+        col("discount_amount"),
+        col("discounted_gross"),
+        col("vat_rate"),
+        col("vat_amount"),
+        col("net_charge"),
+        col("net_discount_amount"),
+        col("net_amount_paid"),
+        col("amount_paid"),
+        col("psp"),
+        col("acquirer"),
+        col("psp_reference"),
+        lit("VENDPARK").alias("provider"),
+        col("_ingested_at"),
+        col("_source_file"),
+        current_timestamp().alias("_cleansed_at"),
     )
-
 
 silver_vendpark = cleanse_vendpark(bronze_vendpark, site_map)
 print(f"VendPark Silver : {silver_vendpark.count():,} rows")
@@ -382,160 +406,181 @@ print(f"VendPark Silver : {silver_vendpark.count():,} rows")
 # MAGIC %md
 # MAGIC ## Provider 3: EasyEntry Cleansing
 # MAGIC
-# MAGIC **Problems to fix:**
-# MAGIC - `charge`        : string with £ symbol (e.g. "£5.00") - strip and cast
-# MAGIC - `exit_time`     : occasionally missing - set to null
-# MAGIC - `duration_mins` : occasionally negative - take absolute value as best estimate
-# MAGIC                     recalculate from timestamps where exit is missing
+# MAGIC Two sub-types:
+# MAGIC - barrier_ticket: has entry/exit/duration/ticket_number, reports GROSS with £ symbol
+# MAGIC - barrierless: no entry/exit/duration, paid_duration_minutes from gross tariff band
 
 # COMMAND ----------
 
-def cleanse_easyentry(df: DataFrame, site_map: DataFrame) -> DataFrame:
-    """
-    Cleanses EasyEntry Bronze data and conforms to canonical Silver schema.
-
-    Key decisions:
-    - £ symbol removal: regexp_replace strips any non-numeric character
-      except the decimal point. Safer than just stripping £ specifically
-      in case the source ever sends $ or EUR symbol instead.
-    - Negative duration: we take the absolute value as a best estimate.
-      A duration of -45 almost certainly means 45 minutes with a sign
-      error in the source system. Documenting this assumption matters.
-    - Missing exit_time: we leave exit_timestamp as null. We do NOT
-      invent an exit time. Duration is also null in this case.
-    """
-
-    # Step 1: Strip currency symbol and cast charge to double
-    # regexp_replace removes anything that is not a digit or decimal point
+def debug_vendpark_cols(df, site_map):
     df = df.withColumn(
-        "charge_amount",
-        regexp_replace(col("charge"), r"[^\d.]", "").cast(DoubleType())
+        "payment_type_clean",
+        upper(regexp_replace(trim(col("payment_type")), r"[\s]+", "_"))
     )
-
-    # Step 2: Parse ISO 8601 timestamps (same format as ParkTech)
     df = (
         df
-        .withColumn(
-            "entry_timestamp",
-            to_timestamp(col("entry_time"), "yyyy-MM-dd'T'HH:mm:ss'Z'")
-        )
-        .withColumn(
-            "exit_timestamp",
-            to_timestamp(col("exit_time"), "yyyy-MM-dd'T'HH:mm:ss'Z'")  # null if empty
-        )
+        .withColumn("entry_timestamp",    to_timestamp(col("arrival"),    "dd/MM/yyyy HH:mm"))
+        .withColumn("exit_timestamp_raw", to_timestamp(col("departure"),  "dd/MM/yyyy HH:mm"))
+        .withColumn("transaction_time",   to_timestamp(col("transaction_time"), "dd/MM/yyyy HH:mm"))
     )
-
-    # Step 3: Fix duration
-    # Cast to integer (empty string and text become null)
-    # Negative values: take absolute value
-    # Missing entirely: recalculate from timestamps if available
+    df = df.withColumn(
+        "exit_timestamp",
+        when(col("exit_timestamp_raw") < col("entry_timestamp"), None)
+        .otherwise(col("exit_timestamp_raw"))
+    )
     df = (
         df
-        .withColumn(
-            "duration_raw",
-            col("duration_mins").cast(IntegerType())
-        )
+        .withColumn("duration_raw", col("stay_minutes").cast(IntegerType()))
         .withColumn(
             "duration_minutes",
-            when(
-                col("duration_raw").isNotNull() & (col("duration_raw") < 0),
-                spark_abs(col("duration_raw"))      # negative -> positive
-            ).when(
-                col("duration_raw").isNotNull() & (col("duration_raw") > 0),
-                col("duration_raw")
-            ).when(
+            when(col("duration_raw").isNotNull() & (col("duration_raw") > 0), col("duration_raw"))
+            .when(
                 col("exit_timestamp").isNotNull() & col("entry_timestamp").isNotNull(),
                 ((col("exit_timestamp").cast("long") - col("entry_timestamp").cast("long")) / 60)
                 .cast(IntegerType())
             ).otherwise(None)
         )
     )
+    
+    print("Columns available before financial block:")
+    print(df.columns)
 
-    # Step 4: Normalise payment_method to UPPER_SNAKE_CASE for consistency
+debug_vendpark_cols(bronze_vendpark, site_map)
+
+# COMMAND ----------
+
+def cleanse_easyentry(df: DataFrame, site_map: DataFrame) -> DataFrame:
+
+    # Strip £ from all price fields
+    for src, tgt in [
+        ("full_price",       "gross_charge_src"),
+        ("discounted_price", "discounted_gross_src"),
+        ("tax_amount",       "vat_amount_src"),
+        ("charged",          "amount_paid_src"),
+    ]:
+        df = df.withColumn(tgt,
+            regexp_replace(col(src), r"[^\d.]", "").cast(DoubleType()))
+
+    # vat_pct is integer string "20" - convert to decimal
+    df = df.withColumn("vat_rate", col("vat_pct").cast(DoubleType()) / 100)
+
+    # Derive discount_amount from gross difference
     df = df.withColumn(
-        "payment_method",
-        upper(trim(col("payment_method")))
+        "discount_amount",
+        spark_round(col("gross_charge_src") - col("discounted_gross_src"), 2)
     )
 
-    # Step 5: Join to site map on EasyEntry UUID
+    # Parse timestamps (empty strings become null)
+    df = (
+        df
+        .withColumn("entry_timestamp",  to_timestamp(col("entry_time"),       "yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        .withColumn("exit_timestamp",   to_timestamp(col("exit_time"),        "yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        .withColumn("transaction_time", to_timestamp(col("transaction_time"), "yyyy-MM-dd'T'HH:mm:ss'Z'"))
+    )
+
+    # Duration for barrier sites
+    df = (
+        df
+        .withColumn("duration_raw", col("duration_mins").cast(IntegerType()))
+        .withColumn(
+            "duration_minutes",
+            when(col("duration_raw").isNotNull() & (col("duration_raw") < 0),
+                spark_abs(col("duration_raw")))
+            .when(col("duration_raw").isNotNull() & (col("duration_raw") > 0),
+                col("duration_raw"))
+            .when(
+                col("exit_timestamp").isNotNull() & col("entry_timestamp").isNotNull(),
+                ((col("exit_timestamp").cast("long") - col("entry_timestamp").cast("long")) / 60)
+                .cast(IntegerType()))
+            .otherwise(None)
+        )
+    )
+
+    # Join to site map
     df = df.join(
-        site_map.select("canonical_site_id", "canonical_site_name", "city", "capacity", "easyentry_uuid"),
+        site_map.select("canonical_site_id","canonical_site_name","city","capacity",
+                        "site_type","site_payment_type","easyentry_uuid"),
         df["site_uuid"] == site_map["easyentry_uuid"],
         how="left"
     )
 
-    # Step 6: Conform to canonical schema
-    return (
-        df
-        .select(
-            col("id").alias("transaction_id"),
-            col("canonical_site_id"),
-            col("canonical_site_name").alias("site_name"),
-            col("city"),
-            col("capacity"),
-            col("entry_timestamp"),
-            col("exit_timestamp"),
-            col("duration_minutes"),
-            col("vehicle_class").alias("vehicle_type"),
-            col("payment_method"),
-            col("card_scheme"),
-            col("charge_amount"),
-            col("discount_code"),
-            col("product_id"),
-            col("psp"),
-            col("acquirer"),
-            col("psp_reference"),
-            lit("EASYENTRY").alias("provider"),
-            col("_ingested_at"),
-            col("_source_file"),
-            current_timestamp().alias("_cleansed_at"),
-        )
+    # paid_duration_minutes for barrierless - uses gross tariff band (pre-discount)
+    df = df.withColumn(
+        "paid_duration_minutes",
+        when(
+            col("site_type") == "barrierless",
+            build_paid_duration_expr("site_uuid", "gross_charge_src")
+        ).otherwise(None)
     )
 
+    # Net financial fields
+    df = (
+        df
+        .withColumn("net_charge",          spark_round(col("gross_charge_src") / VAT_DIVISOR, 2))
+        .withColumn("net_discount_amount", spark_round(col("discount_amount")  / VAT_DIVISOR, 2))
+        .withColumn("net_amount_paid",     spark_round(col("discounted_gross_src") / VAT_DIVISOR, 2))
+    )
+
+    df = df.withColumn("payment_method", upper(trim(col("payment_method"))))
+
+    return df.select(
+        col("id").alias("transaction_id"),
+        col("canonical_site_id"),
+        col("canonical_site_name").alias("site_name"),
+        col("city"),
+        col("capacity"),
+        col("site_type"),
+        col("site_payment_type").alias("payment_type"),
+        lit(None).cast("string").alias("vrm"),
+        col("ticket_number"),
+        col("entry_timestamp"),
+        col("exit_timestamp"),
+        col("transaction_time"),
+        col("duration_minutes"),
+        col("paid_duration_minutes"),
+        col("payment_method"),
+        col("card_scheme"),
+        col("gross_charge_src").alias("gross_charge"),
+        col("discount_code"),
+        col("product_id"),
+        col("discount_amount"),
+        col("discounted_gross_src").alias("discounted_gross"),
+        col("vat_rate"),
+        col("vat_amount_src").alias("vat_amount"),
+        col("net_charge"),
+        col("net_discount_amount"),
+        col("net_amount_paid"),
+        col("amount_paid_src").alias("amount_paid"),
+        col("psp"),
+        col("acquirer"),
+        col("psp_reference"),
+        lit("EASYENTRY").alias("provider"),
+        col("_ingested_at"),
+        col("_source_file"),
+        current_timestamp().alias("_cleansed_at"),
+    )
 
 silver_easyentry = cleanse_easyentry(bronze_easyentry, site_map)
 print(f"EasyEntry Silver : {silver_easyentry.count():,} rows")
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## Unify: Union all three providers into one Silver table
-
-# COMMAND ----------
-
-# ─── Union all three providers ────────────────────────────────────────────────
-#
-# All three DataFrames now share identical schemas.
-# unionByName is safer than union() because it matches columns by name
-# rather than position, so a column order difference cannot silently
-# corrupt data.
-
 silver_unified = (
     silver_parktech
     .unionByName(silver_vendpark)
     .unionByName(silver_easyentry)
 )
-
-total = silver_unified.count()
-print(f"Unified Silver total : {total:,} rows")
+print(f"Unified Silver total : {silver_unified.count():,} rows")
 
 # COMMAND ----------
 
-# ─── Write Silver tables ──────────────────────────────────────────────────────
-#
-# We write two tables:
-# 1. silver_transactions_unified : the full merged dataset for Gold to consume
-# 2. Individual provider tables  : useful for provider-specific analysis
-#    and debugging. If Gold produces a suspect number you can quickly
-#    isolate which provider contributed it.
-
 print("\nWriting Silver tables...")
 
-# Individual provider tables
 for name, df in [
-    ("silver_parktech",  silver_parktech),
-    ("silver_vendpark",  silver_vendpark),
-    ("silver_easyentry", silver_easyentry),
+    ("silver_parktech",             silver_parktech),
+    ("silver_vendpark",             silver_vendpark),
+    ("silver_easyentry",            silver_easyentry),
+    ("silver_transactions_unified", silver_unified),
 ]:
     (
         df.write
@@ -546,114 +591,127 @@ for name, df in [
     )
     print(f"  Written : {SILVER_DATABASE}.{name}")
 
-# Unified table
-(
-    silver_unified.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(f"{SILVER_DATABASE}.silver_transactions_unified")
-)
-print(f"  Written : {SILVER_DATABASE}.silver_transactions_unified")
-
 # COMMAND ----------
-
-# ─── Verification ─────────────────────────────────────────────────────────────
 
 print("\nVerification - Silver table row counts:")
 print("-" * 55)
-
-tables = [
-    "silver_parktech",
-    "silver_vendpark",
-    "silver_easyentry",
-    "silver_transactions_unified",
-]
-
-for t in tables:
-    count = spark.table(f"{SILVER_DATABASE}.{t}").count()
-    print(f"  {t:<35} {count:>8,} rows")
+for t in ["silver_parktech","silver_vendpark","silver_easyentry","silver_transactions_unified"]:
+    c = spark.table(f"{SILVER_DATABASE}.{t}").count()
+    print(f"  {t:<40} {c:>8,} rows")
 
 # COMMAND ----------
 
-# ─── Data quality checks ──────────────────────────────────────────────────────
-#
-# Always validate the output of a cleansing step.
-# These checks confirm the specific problems from Bronze have been resolved.
+from pyspark.sql.functions import abs as spark_abs
 
-print("\nData quality checks on unified Silver:")
+unified.withColumn(
+    "diff",
+    col("discount_amount") + col("discounted_gross") - col("gross_charge")
+).filter(
+    col("diff").isNotNull()
+).selectExpr(
+    "min(diff) as min_diff",
+    "max(diff) as max_diff",
+    "avg(diff) as avg_diff",
+    "count(*) as total_rows",
+    "sum(case when abs(diff) > 0.01 then 1 else 0 end) as over_1p",
+    "sum(case when abs(diff) > 0.001 then 1 else 0 end) as over_0p1",
+    "sum(case when abs(diff) != 0 then 1 else 0 end) as any_diff",
+).show()
+
+# COMMAND ----------
+
+unified.withColumn(
+    "diff",
+    col("discount_amount") + col("discounted_gross") - col("gross_charge")
+).filter(col("diff") > 1.0) \
+.select(
+    "provider", "canonical_site_id", "discount_code",
+    "gross_charge", "discount_amount", "discounted_gross",
+    "diff"
+).show(20, truncate=False)
+
+# COMMAND ----------
+
+for table in ["silver_vendpark", "silver_easyentry", "silver_parktech"]:
+    print(f"\n{table}:")
+    spark.table(f"parking_silver.{table}").withColumn(
+        "diff",
+        col("discount_amount") + col("discounted_gross") - col("gross_charge")
+    ).filter(
+        spark_abs(col("diff")) > 0.01
+    ).select(
+        "transaction_id",
+        "discount_code",
+        "gross_charge",
+        "discount_amount",
+        "discounted_gross",
+        "diff"
+    ).show(20, truncate=False)
+
+# COMMAND ----------
+
+print("\nData quality checks:")
 print("-" * 55)
-
 unified = spark.table(f"{SILVER_DATABASE}.silver_transactions_unified")
-total   = unified.count()
 
-# 1. No £ symbols remaining in charge_amount (it is now a double)
-null_charges = unified.filter(col("charge_amount").isNull()).count()
-print(f"  Null charge_amount      : {null_charges:,}  (expect ~0)")
+checks = [
+    ("Null gross_charge (dirty source rows)", unified.filter(col("gross_charge").isNull()).count(), "expect ~537"),
+    ("UNKNOWN payment_method",             unified.filter(col("payment_method") == "UNKNOWN").count(),    "expect 0"),
+    ("Mixed-case payment_method",          unified.filter(col("payment_method") != upper(col("payment_method"))).count(), "expect 0"),
+    ("Negative duration_minutes",          unified.filter(col("duration_minutes").isNotNull() & (col("duration_minutes") < 0)).count(), "expect 0"),
+    ("Missing canonical_site_id",          unified.filter(col("canonical_site_id").isNull()).count(),     "expect 0"),
+    ("Barrierless with duration",          unified.filter((col("site_type") == "barrierless") & col("duration_minutes").isNotNull()).count(), "expect 0"),
+    ("Barrier with paid_duration",         unified.filter((col("site_type") != "barrierless") & col("paid_duration_minutes").isNotNull()).count(), "expect 0"),
+    ("net*1.2 != amount_paid",             unified.filter(spark_round(col("net_amount_paid") * 1.20, 1) != spark_round(col("amount_paid"), 1)).count(), "expect 0"),
+    ("discount+discounted != gross (>1p tolerance)", unified.filter(spark_abs(col("discount_amount") + col("discounted_gross") - col("gross_charge")) > 0.01).count(), "expect 0"),
+]
 
-# 2. No UNKNOWN payment methods
-unknown_methods = unified.filter(col("payment_method") == "UNKNOWN").count()
-print(f"  UNKNOWN payment_method  : {unknown_methods:,}  (expect 0)")
+for label, result, note in checks:
+    print(f"  {label:<45} {result:>6,}  ({note})")
 
-# 3. No mixed case payment methods - all should be UPPER_SNAKE_CASE
-mixed_case = unified.filter(
-    col("payment_method") != upper(col("payment_method"))
-).count()
-print(f"  Mixed-case payment_method : {mixed_case:,}  (expect 0)")
+# COMMAND ----------
 
-# 4. No negative durations
-negative_dur = unified.filter(
-    col("duration_minutes").isNotNull() & (col("duration_minutes") < 0)
-).count()
-print(f"  Negative duration_minutes : {negative_dur:,}  (expect 0)")
-
-# 5. All rows have a canonical_site_id
-missing_site = unified.filter(col("canonical_site_id").isNull()).count()
-print(f"  Missing canonical_site_id : {missing_site:,}  (expect 0)")
-
-# 6. Provider breakdown
-print("\nRow count by provider:")
+print("\nFinancial summary by provider:")
 (
     unified
     .groupBy("provider")
-    .count()
+    .agg(
+        spark_round(spark_sum("gross_charge"),    2).alias("total_gross"),
+        spark_round(spark_sum("discount_amount"), 2).alias("total_discounts"),
+        spark_round(spark_sum("vat_amount"),      2).alias("total_vat"),
+        spark_round(spark_sum("net_amount_paid"), 2).alias("total_net_paid"),
+        spark_round(spark_sum("amount_paid"),     2).alias("total_paid"),
+    )
     .orderBy("provider")
-    .show()
+    .show(truncate=False)
 )
 
-# 7. Acquirer breakdown - confirms AMEX/Worldpay routing is intact
-print("Acquirer breakdown:")
-(
-    unified
-    .groupBy("acquirer")
-    .count()
-    .orderBy("acquirer")
-    .show()
-)
+print("\nSite type and payment type breakdown:")
+unified.groupBy("site_type","payment_type").count().orderBy("site_type").show()
 
 # COMMAND ----------
 
-# ─── Side by side comparison: Bronze vs Silver ────────────────────────────────
-#
-# This is the money shot. Show the same data before and after cleansing.
-# Useful for interviews and for the README.
+# ─── Before / after comparison ────────────────────────────────────────────────
 
-print("EasyEntry - Bronze (raw £ symbol in charge):")
-spark.table(f"{BRONZE_DATABASE}.bronze_easyentry") \
-    .select("id", "charge", "duration_mins", "exit_time") \
-    .show(5, truncate=False)
-
-print("EasyEntry - Silver (charge as double, duration fixed):")
-spark.table(f"{SILVER_DATABASE}.silver_easyentry") \
-    .select("transaction_id", "charge_amount", "duration_minutes", "exit_timestamp") \
-    .show(5, truncate=False)
-
-print("VendPark - Bronze (mixed case payment_type):")
+print("VendPark Bronze (NET basis):")
 spark.table(f"{BRONZE_DATABASE}.bronze_vendpark") \
-    .select("txn_ref", "payment_type", "arrival", "departure") \
+    .select("txn_ref","net_charge","discount_code","discounted_net","vat_amount","amount_paid") \
     .show(5, truncate=False)
 
-print("VendPark - Silver (normalised payment_method, parsed timestamps):")
+print("VendPark Silver (GROSS basis, normalised):")
 spark.table(f"{SILVER_DATABASE}.silver_vendpark") \
-    .select("transaction_id", "payment_method", "entry_timestamp", "exit_timestamp") \
+    .select("transaction_id","gross_charge","discount_code","discount_amount",
+            "discounted_gross","vat_amount","net_amount_paid","amount_paid") \
     .show(5, truncate=False)
+
+print("EasyEntry Bronze (£ symbols, integer vat_pct, ticket numbers):")
+spark.table(f"{BRONZE_DATABASE}.bronze_easyentry") \
+    .select("id","site_name","ticket_number","full_price","discounted_price","vat_pct","charged") \
+    .show(5, truncate=False)
+
+print("EasyEntry Silver (clean doubles, paid_duration for barrierless):")
+spark.table(f"{SILVER_DATABASE}.silver_easyentry") \
+    .select("transaction_id","site_name","site_type","ticket_number",
+            "gross_charge","discount_amount","net_amount_paid","amount_paid",
+            "duration_minutes","paid_duration_minutes") \
+    .show(10, truncate=False)
