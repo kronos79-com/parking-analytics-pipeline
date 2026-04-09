@@ -395,7 +395,6 @@ def _write(path: str, rows: list):
 # ─── Run ─────────────────────────────────────────────────────────────────────
 
 import os
-os.makedirs("/dbfs/FileStore/tables", exist_ok=True)
 
 generate_parktech ("/dbfs/FileStore/tables/parktech_march_2025.csv")
 generate_vendpark ("/dbfs/FileStore/tables/vendpark_march_2025.csv")
