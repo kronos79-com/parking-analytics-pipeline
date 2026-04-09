@@ -155,8 +155,8 @@ gold_revenue_by_acquirer = (
     silver
     .groupBy(
         "transaction_date",
-        "acquirer",
         "psp",
+        "acquirer",
     )
     .agg(
         count("transaction_id")                         .alias("transaction_count"),
@@ -164,7 +164,7 @@ gold_revenue_by_acquirer = (
         spark_round(avg("charge_amount"), 2)            .alias("avg_charge"),
         countDistinct("canonical_site_id")              .alias("sites_count"),
     )
-    .orderBy("transaction_date", "acquirer")
+    .orderBy("transaction_date", "psp")
 )
 
 count_rba = gold_revenue_by_acquirer.count()
