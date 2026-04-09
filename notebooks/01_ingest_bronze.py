@@ -235,21 +235,15 @@ def ingest_to_bronze(source: dict) -> None:
         row_count = df.count()
         print(f"[{source['provider']}] Rows read    : {row_count:,}")
 
-        # Write to Delta - overwrite ensures a clean reload on every run
+        # Write as a managed Unity Catalog table
+        # Unity Catalog handles storage location automatically
         (
             df.write
             .format("delta")
             .mode("overwrite")
             .option("overwriteSchema", "true")
-            .save(delta_path)
+            .saveAsTable(f"{BRONZE_DATABASE}.{table_name}")
         )
-
-        # Register table in the metastore so it is queryable by name
-        spark.sql(f"""
-            CREATE TABLE IF NOT EXISTS {BRONZE_DATABASE}.{table_name}
-            USING DELTA
-            LOCATION '{delta_path}'
-        """)
 
         print(f"[{source['provider']}] Written to  : {delta_path}")
         print(f"[{source['provider']}] Table       : {BRONZE_DATABASE}.{table_name}  DONE")
@@ -322,4 +316,4 @@ spark.table(f"{BRONZE_DATABASE}.bronze_site_map").show(10, truncate=False)
 #   spark.read.format("delta").option("versionAsOf", 0).load(path)
 
 print("\nDelta transaction log - ParkTech Bronze:")
-spark.sql(f"DESCRIBE HISTORY delta.`/delta/bronze/bronze_parktech`").show(5, truncate=False)
+spark.sql(f"DESCRIBE HISTORY {BRONZE_DATABASE}.bronze_parktech").show(5, truncate=False)
