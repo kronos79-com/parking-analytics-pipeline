@@ -173,6 +173,7 @@ def generate_parktech(path: str):
                 if is_cash:
                     card_scheme    = "N/A"
                     payment_method = "CASH"
+                    psp            = "N/A"
                     acquirer       = "N/A"
                     psp_reference  = "N/A"
                 else:
@@ -234,6 +235,7 @@ def generate_vendpark(path: str):
                 if is_cash:
                     card_scheme    = "N/A"
                     raw_method     = "CASH"
+                    psp            = "N/A"
                     acquirer       = "N/A"
                     psp_reference  = "N/A"
                 else:
@@ -319,6 +321,7 @@ def generate_easyentry(path: str):
                 if is_cash:
                     card_scheme    = "N/A"
                     payment_method = "CASH"
+                    psp            = "N/A"
                     acquirer       = "N/A"
                     psp_reference  = "N/A"
                 else:
